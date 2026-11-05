@@ -1,0 +1,7 @@
+name: astrbot_plugin_reply_redo
+display_name: 重答与记忆撤销
+desc: 管理员私聊文本回复支持五分钟内重答，并取消 AngelMemory 尚未提交的自动记忆整理。
+version: v0.1.1
+author: wtx
+astrbot_version: '>=4.29.3'
+repo: https://github.com/ninthsister/astrbot_plugin_reply_redo
