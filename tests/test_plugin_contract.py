@@ -106,4 +106,105 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.capture(e,req)
         self.assertFalse(hasattr(e,'_reply_redo_ticket'))
 
+    async def protected_round(self):
+        event=Event()
+        req=types.SimpleNamespace(conversation=self.conv,image_urls=[],audio_urls=[],prompt='question',func_tool=None)
+        await self.plugin.capture(event,req)
+        await self.plugin.response(event,types.SimpleNamespace(completion_text='answer'))
+        await self.manager.handle_memory_consolidation(event)
+        self.conv.history=json.dumps([{'role':'user','content':'question'},{'role':'assistant','content':'answer'}])
+        return event
+
+    async def test_manager_reload_recovers_new_round_without_restart(self):
+        self.plugin.bind_angel()
+        old_manager=self.manager
+        self.manager=types.SimpleNamespace(handle_memory_consolidation=self.original)
+        event=await self.protected_round()
+        self.assertIs(old_manager.handle_memory_consolidation,self.original)
+        self.assertIs(self.plugin.bound,self.manager)
+        self.assertEqual(event._reply_redo_ticket.status,'pending')
+        out=[x async for x in self.plugin.undo(Event())]
+        self.assertIn('不重新生成',out[0]['error'])
+        self.assertEqual(self.commits,[])
+
+    async def test_old_round_rejected_but_next_round_recovers(self):
+        old=await self.protected_round()
+        self.manager=types.SimpleNamespace(handle_memory_consolidation=self.original)
+        out=[x async for x in self.plugin.undo(Event())]
+        self.assertIn('无需重启',out[0]['error'])
+        self.assertIsNone(self.saved)
+        self.assertEqual(old._reply_redo_ticket.status,'pending')
+        self.conv.history='[]'
+        new=await self.protected_round()
+        out=[x async for x in self.plugin.redo(Event())]
+        self.assertEqual(out[0]['prompt'],'question')
+        self.assertEqual(new._reply_redo_ticket.status,'cancelled')
+        self.assertEqual(self.commits,[])
+
+    async def test_foreign_wrapper_chain_commits_once_and_is_preserved(self):
+        self.plugin.bind_angel()
+        previous=self.manager.handle_memory_consolidation
+        calls=[]
+        async def other(event,ctx=None):
+            calls.append(event)
+            return await previous(event,ctx)
+        self.manager.handle_memory_consolidation=other
+        event=await self.protected_round()
+        self.assertEqual(self.commits,[])
+        self.assertEqual(calls,[])
+        await self.plugin.gate.commit(event._reply_redo_ticket)
+        self.assertEqual(self.commits,[event])
+        self.assertEqual(calls,[event])
+        await self.plugin.terminate()
+        self.assertIs(self.manager.handle_memory_consolidation,other)
+
+    async def test_disabled_or_missing_plugin_recovers_automatically(self):
+        self.plugin.bind_angel()
+        getter=self.ctx.get_registered_star
+        self.ctx.get_registered_star=lambda name:types.SimpleNamespace(activated=False,star_cls=types.SimpleNamespace(plugin_manager=self.manager))
+        self.assertFalse(self.plugin.bind_angel())
+        self.assertIn('未启用',self.plugin.binding_error)
+        self.ctx.get_registered_star=lambda name:None
+        self.assertFalse(self.plugin.bind_angel())
+        self.ctx.get_registered_star=getter
+        event=await self.protected_round()
+        self.assertEqual(event._reply_redo_ticket.status,'pending')
+
+    async def test_disabled_interval_invalidates_previous_round(self):
+        event=await self.protected_round()
+        getter=self.ctx.get_registered_star
+        self.ctx.get_registered_star=lambda name:None
+        self.assertFalse(self.plugin.bind_angel())
+        self.ctx.get_registered_star=getter
+        out=[x async for x in self.plugin.undo(Event())]
+        self.assertIn('接入变化之前',out[0]['error'])
+        self.assertIsNone(self.saved)
+        self.assertEqual(event._reply_redo_ticket.status,'pending')
+
+    async def test_reload_during_history_read_does_not_rollback(self):
+        event=await self.protected_round()
+        async def reloading_get(umo,cid):
+            self.manager=types.SimpleNamespace(handle_memory_consolidation=self.original)
+            return self.conv
+        self.ctx.conversation_manager.get_conversation=reloading_get
+        out=[x async for x in self.plugin.undo(Event())]
+        self.assertIn('接入变化之前',out[0]['error'])
+        self.assertIsNone(self.saved)
+        self.assertEqual(event._reply_redo_ticket.status,'pending')
+
+    async def test_foreign_ticket_is_not_swallowed(self):
+        self.plugin.bind_angel()
+        event=Event()
+        event._reply_redo_ticket=types.SimpleNamespace(status='waiting')
+        await self.manager.handle_memory_consolidation(event)
+        self.assertEqual(self.commits,[event])
+
+    async def test_initializing_plugin_does_not_prevent_later_binding(self):
+        getter=self.ctx.get_registered_star
+        self.ctx.get_registered_star=lambda name:types.SimpleNamespace(star_cls=None)
+        self.assertFalse(self.plugin.bind_angel())
+        self.assertIn('初始化',self.plugin.binding_error)
+        self.ctx.get_registered_star=getter
+        self.assertTrue(self.plugin.bind_angel())
+
 if __name__=='__main__': unittest.main()

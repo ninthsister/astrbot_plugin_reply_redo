@@ -8,7 +8,7 @@ from astrbot.api.star import Context, Star, register
 from .rollback import Ticket, DelayGate, validate_tail
 
 
-@register('astrbot_plugin_reply_redo', 'wtx', '重答上一轮并取消待写入的 AngelMemory 记忆', '0.1.1')
+@register('astrbot_plugin_reply_redo', 'wtx', '重答上一轮并取消待写入的 AngelMemory 记忆', '0.1.2')
 class ReplyRedo(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -20,25 +20,35 @@ class ReplyRedo(Star):
         self.original = None
         self.wrapper = None
         self.closing = False
+        self.binding_error = 'AngelMemory 尚未接入'
 
     def bind_angel(self):
+        if self.closing:
+            self.binding_error = '本插件正在停用'
+            return False
         meta = self.context.get_registered_star('astrbot_plugin_angel_memory')
+        if meta is None or not getattr(meta, 'activated', True):
+            self.binding_error = 'AngelMemory 未加载或未启用；启用后发送新的私聊文本即可自动接入'
+            return False
         angel = getattr(meta, 'star_cls', None)
         manager = getattr(angel, 'plugin_manager', None)
-        if manager is None:
+        if manager is None or getattr(angel, '_is_terminating', False):
+            self.binding_error = 'AngelMemory 正在初始化或关闭；就绪后发送新的私聊文本即可自动接入'
             return False
-        if self.bound is manager and manager.handle_memory_consolidation is self.wrapper:
+        current = getattr(manager, 'handle_memory_consolidation', None)
+        if self.bound is manager and current is self.wrapper and not self.binding_error:
+            self.binding_error = ''
             return True
-        # Fail closed after another plugin or hot reload replaces our integration.
-        if self.bound is not None:
-            return False
-        original = getattr(manager, 'handle_memory_consolidation', None)
+        original = self.original if self.bound is manager and current is self.wrapper else current
         if not callable(original):
+            self.binding_error = 'AngelMemory 缺少兼容的记忆整理入口，请检查插件版本'
             return False
 
         async def wrapped(event, event_plugin_context=None):
             ticket = getattr(event, '_reply_redo_ticket', None)
-            if self.closing or ticket is None:
+            # A previous wrapper may still be inside another plugin's wrapper.
+            # Only the wrapper that captured this round may defer it.
+            if self.closing or ticket is None or getattr(ticket, 'integration', None) is not wrapped:
                 return await original(event, event_plugin_context)
             if ticket.status == 'waiting':
                 async def commit():
@@ -54,10 +64,22 @@ class ReplyRedo(Star):
                 ticket.task.add_done_callback(finished)
             return {'status': 'skipped', 'message': 'ReplyRedo owns deferred consolidation'}
 
+        # Detach from an old manager only if we still own its entry point.
+        # Never overwrite another plugin's wrapper during cleanup.
+        if (self.bound is not None and self.bound is not manager
+                and getattr(self.bound, 'handle_memory_consolidation', None) is self.wrapper):
+            self.bound.handle_memory_consolidation = self.original
         manager.handle_memory_consolidation = wrapped
         self.bound, self.original, self.wrapper = manager, original, wrapped
+        self.binding_error = ''
         logger.info('[ReplyRedo] AngelMemory 自动整理已接入延迟提交')
         return True
+
+    def validate_binding(self, ticket):
+        if not self.bind_angel():
+            raise ValueError(self.binding_error)
+        if ticket.integration is not self.wrapper:
+            raise ValueError('AngelMemory 接入已自动恢复，但上一轮产生于接入变化之前，无法保证完整撤销。请发送新的私聊文本后再试，无需重启本插件。')
 
     @filter.on_astrbot_loaded()
     async def ready(self):
@@ -78,6 +100,7 @@ class ReplyRedo(Star):
         ticket = Ticket(event, event.unified_msg_origin, req.conversation.cid,
                         copy.deepcopy(before), req.prompt or '', str(event.get_sender_id()),
                         copy.deepcopy(getattr(event, 'angelheart_context', None)))
+        ticket.integration = self.wrapper
         event._reply_redo_ticket = ticket
         self.latest[ticket.session] = ticket
 
@@ -120,8 +143,7 @@ class ReplyRedo(Star):
             return
         cm = self.context.conversation_manager
         try:
-            if not self.bind_angel():
-                raise ValueError('AngelMemory 已重载或卸载，请重启本插件后再使用。')
+            self.validate_binding(ticket)
             cid = await cm.get_curr_conversation_id(ticket.session)
             if cid != ticket.cid:
                 raise ValueError('当前对话已切换，不能撤销旧对话。')
@@ -129,6 +151,8 @@ class ReplyRedo(Star):
             if conv is None:
                 raise ValueError('对话不存在。')
             validate_tail(ticket.before, json.loads(conv.history or '[]'), ticket.response)
+            # Context I/O above can yield while AngelMemory is being reloaded.
+            self.validate_binding(ticket)
             # No await between pending-state check and cancellation.
             self.gate.cancel(ticket)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -164,11 +188,14 @@ class ReplyRedo(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def status(self, event: AstrMessageEvent):
         event.should_call_llm(False)
-        ticket = self.latest.get(event.unified_msg_origin)
         bound = self.bind_angel()
+        ticket = self.latest.get(event.unified_msg_origin)
+        state = ticket.status if ticket else '无'
+        if ticket and (not bound or ticket.integration is not self.wrapper):
+            state += '（接入已变化，此轮不可撤销）'
         yield event.plain_result(
-            f'AngelMemory 接入：{bound}；重答窗口：{self.gate.seconds}秒；'
-            f'上一轮状态：{ticket.status if ticket else "无"}。'
+            f'AngelMemory 接入：{"正常" if bound else self.binding_error}；重答窗口：{self.gate.seconds}秒；'
+            f'上一轮状态：{state}。'
             '仅 pending 状态支持撤销记忆；不撤回 QQ 中已发送的消息。')
 
     async def terminate(self):
@@ -177,5 +204,5 @@ class ReplyRedo(Star):
         for result in results:
             if isinstance(result, BaseException):
                 logger.error(f'[ReplyRedo] 停用时记忆提交失败：{type(result).__name__}')
-        if self.bound and self.bound.handle_memory_consolidation is self.wrapper:
+        if self.bound and getattr(self.bound, 'handle_memory_consolidation', None) is self.wrapper:
             self.bound.handle_memory_consolidation = self.original

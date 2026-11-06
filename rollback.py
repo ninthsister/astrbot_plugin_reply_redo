@@ -37,6 +37,7 @@ class Ticket:
     status: str = 'waiting'
     task: object = None
     commit: object = None
+    integration: object = None
 
 
 class DelayGate:
